@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shape Morph</title>
+<style>
+@font-face{font-family:"Geist";src:url("data:font/woff2;base64,/*GEIST*/") format("woff2");font-weight:100 900;font-style:normal}
+:root{--canvas:#E7E5E0;--ink:#0B0B0B;--paper:#FFFFFF;--mute:#8B8882;--rule:#ECEAE6;--well:#F1EFEB}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--canvas)}
+body.preview{display:grid;place-items:center;height:100vh;overflow:hidden}
+#stage{position:relative;width:1440px;height:1440px;overflow:hidden;background:var(--canvas);
+  font-family:"Geist",system-ui,sans-serif;-webkit-font-smoothing:antialiased;color:var(--ink);letter-spacing:-0.01em}
+body.preview #stage{transform-origin:50% 50%;flex:none}
+#world{position:absolute;left:0;top:0;width:0;height:0;transform-origin:0 0}
+#shape{position:absolute;overflow:hidden;isolation:isolate}
+.layer,.abs{position:absolute}
+.layer{transform-origin:50% 50%}
+.row{display:flex;align-items:center}
+.num{font-feature-settings:"tnum" 1}
+svg{display:block;overflow:visible}
+#cursor{position:absolute;left:0;top:0;width:44px;height:44px;transform-origin:7px 4px;
+  filter:drop-shadow(0 2px 3px rgba(0,0,0,.18))}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="world">
+    <div id="shape">
+      <div id="seg" class="abs" style="height:60px;width:420px;border-radius:30px;background:var(--well)"></div>
+      <div id="pill" class="abs"></div>
+      <div id="volN" class="abs num" style="height:64px;line-height:64px;font-size:17px;font-weight:500;text-align:right;width:60px"></div>
+    </div>
+  </div>
+  <svg id="cursor" viewBox="0 0 44 44"><path d="M7 4 L7 33 L14.2 26.3 L19 37.4 L24.6 35 L19.8 24.2 L29.6 24.2 Z" fill="#0B0B0B" stroke="#fff" stroke-width="2.4" stroke-linejoin="round"/></svg>
+</div>
+<script>
+'use strict';
+/* ───────────────────────── time grid ───────────────────────── */
+const BPM = 120, BEAT = 60 / BPM, BARS = 7, LOOP = BARS * 4 * BEAT;   // 14 s
+const TAU = Math.PI * 2;
+
+/* ───────────────────────── springs ─────────────────────────
+   Closed-form step response of a damped spring, 0 → 1.
+   f = natural frequency (Hz), z = damping ratio. z ≥ 0.8 keeps overshoot ≤ 1.5 %. */
+const SP = {
+  shape:  { f: 2.3, z: 0.82 },
+  ink:    { f: 4.2, z: 1 },
+  cam:    { f: 1.3, z: 0.96 },
+  camZ:   { f: 1.15, z: 0.96 },
+  cursor: { f: 2.7, z: 1 },
+  lead:   { f: 3.6, z: 0.8 },
+  trail:  { f: 1.75, z: 0.9 },
+  press:  { f: 9, z: 0.75 },
+  hold:   { f: 7, z: 1 },
+  icon:   { f: 4, z: 0.82 },
+  snap:   { f: 3.2, z: 0.78 },
+  cin:    { f: 3.4, z: 1 },
+  cout:   { f: 7.5, z: 1 },
+  draw:   { f: 1.6, z: 1 },
+  fast:   { f: 6, z: 1 },
+};
+function H(t, sp) {
+  if (t <= 0) return 0;
+  const w = TAU * sp.f, z = sp.z;
+  if (z >= 1) return 1 - Math.exp(-w * t) * (1 + w * t);
+  const wd = w * Math.sqrt(1 - z * z);
+  return 1 - Math.exp(-z * w * t) * (Math.cos(wd * t) + (z * w / wd) * Math.sin(wd * t));
+}
+/* Free response: displacement from rest, released at x0 with velocity v0. */
+function free(x0, v0, t, sp) {
+  if (t <= 0) return x0;
+  const w = TAU * sp.f, z = sp.z;
+  if (z >= 1) return Math.exp(-w * t) * (x0 + (v0 + w * x0) * t);
+  const wd = w * Math.sqrt(1 - z * z);
+  return Math.exp(-z * w * t) * (x0 * Math.cos(wd * t) + ((v0 + z * w * x0) / wd) * Math.sin(wd * t));
+}
+/* A value that changes target many times = sum of one spring per change.
+   Periodic tracks also add the previous loop's springs, so v(LOOP) === v(0)
+   with matching velocity (needs the last target to equal the first). */
+class Track {
+  constructor(v0, sp = SP.shape, periodic = true) { this.v0 = v0; this.sp = sp; this.p = periodic; this.ev = []; }
+  to(t, v, sp = this.sp) { this.ev.push({ t, v, sp }); this.ev.sort((a, b) => a.t - b.t); return this; }
+  at(t) {
+    let prev = this.v0, s = this.v0;
+    for (const e of this.ev) {
+      const d = e.v - prev; prev = e.v;
+      if (d) s += d * (H(t - e.t, e.sp) + (this.p ? H(t - e.t + LOOP, e.sp) : 0));
+    }
+    return s;
+  }
+  check(name) { if (this.p && this.ev.length && Math.abs(this.ev[this.ev.length - 1].v - this.v0) > 1e-9) console.warn('track does not loop:', name); }
+}
+/* 0 → 1 rise at a, 1 → 0 fall at b, wrapped around the loop. */
+function win(t, a, b, inSp = SP.cin, outSp = SP.cout) {
+  const f = x => H(x - a, inSp) * (1 - H(x - b, outSp));
+  return Math.max(f(t), f(t + LOOP), f(t - LOOP));
+}
+/* A press: dips toward 1 at a, returns at b. */
+const held = (t, a, b, sp = SP.hold) => H(t - a, sp) - H(t - b, sp);
+const tap = (t, a) => held(t, a, a + 0.09, SP.press);
+
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, u) => a + (b - a) * u;
+const px = v => v.toFixed(2) + 'px';
+const gray = k => { const c = Math.round(255 - (255 - 11) * clamp(k, 0, 1)); return `rgb(${c},${c},${c})`; };
+
+/* ───────────────────────── icons (one stroke weight: 2 world px) ───────────────────────── */
+const ICON = {
+  arrow: '<path d="M5 12h13.5M12.5 6l6 6-6 6"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  search: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/>',
+  speaker: '<path d="M4 9.5v5h3.6l4.9 4V5.5l-4.9 4z" fill="currentColor"/><path d="M16 9.2a4 4 0 0 1 0 5.6M18.8 6.5a7.8 7.8 0 0 1 0 11"/>',
+  chart: '<path d="M4 19.5h16M6.5 15l4-4.2 3.2 3 5.3-6.3"/>',
+  mic: '<rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M5.8 11.5a6.2 6.2 0 0 0 12.4 0M12 17.8v2.7"/>',
+  prev: '<path d="M6.5 6v12"/><path d="M18 6.6v10.8L10 12z" fill="currentColor"/>',
+  next: '<path d="M17.5 6v12"/><path d="M6 6.6v10.8L14 12z" fill="currentColor"/>',
+};
+function icon(name, size, color = 'currentColor', extra = '') {
+  const sw = (2 * 24 / size).toFixed(3);
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" style="color:${color}" ${extra}>${ICON[name]}</svg>`;
+}
+
+/* ───────────────────────── chart data ───────────────────────── */
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const VALS = [6.2, 7.0, 6.6, 8.1, 9.4, 8.8, 11.2, 10.6, 12.9, 14.1, 16.8, 15.9];
+const CH = { x0: 28, dx: 36, yb: 340, yh: 140, vmin: 5, vmax: 18 };
+const cy_ = v => CH.yb - (v - CH.vmin) / (CH.vmax - CH.vmin) * CH.yh;
+const PTS = VALS.map((v, i) => [CH.x0 + i * CH.dx, cy_(v)]);
+function crY(u) {                     // Catmull-Rom y at fractional index u (x is linear in u)
+  const i = clamp(Math.floor(u), 0, PTS.length - 2), s = u - i;
+  const p = k => PTS[clamp(k, 0, PTS.length - 1)][1];
+  const p0 = p(i - 1), p1 = p(i), p2 = p(i + 1), p3 = p(i + 2);
+  return 0.5 * ((2 * p1) + (-p0 + p2) * s + (2 * p0 - 5 * p1 + 4 * p2 - p3) * s * s + (-p0 + 3 * p1 - 3 * p2 + p3) * s * s * s);
+}
+function linePath() {
+  let d = `M${PTS[0][0]} ${PTS[0][1]}`;
+  for (let i = 0; i < PTS.length - 1; i++) {
+    const P = k => PTS[clamp(k, 0, PTS.length - 1)];
+    const [a, b, c, e] = [P(i - 1), P(i), P(i + 1), P(i + 2)];
+    d += ` C${b[0] + (c[0] - a[0]) / 6} ${b[1] + (c[1] - a[1]) / 6} ${c[0] - (e[0] - b[0]) / 6} ${c[1] - (e[1] - b[1]) / 6} ${c[0]} ${c[1]}`;
+  }
+  return d;
+}
+
+/* ───────────────────────── timeline ─────────────────────────
+   Beat n (1-based) starts at (n-1)·0.5 s. 28 beats = 7 bars.            */
+const S = { w: new Track(240), h: new Track(64), r: new Track(32), y: new Track(0), ink: new Track(1, SP.ink) };
+const CAM = { x: new Track(0, SP.cam), y: new Track(0, SP.cam), z: new Track(3.4, SP.camZ) };
+function morph(t, g) {
+  for (const k of ['w', 'h', 'r', 'y']) if (k in g) S[k].to(t, g[k]);
+  if ('ink' in g) S.ink.to(t, g.ink);
+  if ('z' in g) CAM.z.to(t + 0.04, g.z);
+  if ('cy' in g) CAM.y.to(t + 0.04, g.cy);
+}
+const PAL_TOP = 124, palH = n => n ? 60 + 1 + 8 + 44 * n + 8 : 60;
+morph(0.56,  { w: 72, h: 72, r: 36, z: 4.1 });                       // b2  button → loader
+morph(1.5,   { w: 80, h: 80, r: 40 }); morph(1.6, { w: 72, h: 72, r: 36 }); // b4 check pop
+morph(2.0,   { w: 300, h: 52, r: 26, z: 2.75 });                     // b5  dynamic island
+morph(2.5,   { w: 360, h: 224, r: 28, ink: 0, z: 2.3 });             // b6  music player
+morph(4.5,   { w: 360, h: 64, r: 32, ink: 1, z: 2.1 });              // b10 volume slider
+morph(6.0,   { w: 112, h: 64, r: 32, ink: 0.2, z: 3.5 });            // b13 toggle (off)
+morph(6.5,   { ink: 1 });                                            // b14 toggle on
+morph(7.0,   { w: 420, h: 60, r: 30, ink: 0, z: 2.05 });             // b15 tabs
+morph(8.5,   { w: 452, h: 400, r: 28, y: 154, z: 1.95, cy: 154 });   // b18 chart opens down
+morph(10.5,  { w: 420, h: 60, r: 30, y: PAL_TOP + 30, z: 2.1 });     // b22 ⌘K
+morph(11.0,  { h: palH(3), y: PAL_TOP + palH(3) / 2, cy: 178 });     // b23 type “v”
+morph(11.125,{ h: palH(2), y: PAL_TOP + palH(2) / 2 });              //     “vo”
+morph(11.25, { h: palH(1), y: PAL_TOP + palH(1) / 2 });              //     “vol”
+morph(12.0,  { w: 340, h: 60, r: 30, ink: 1, y: 154, z: 2.55, cy: 154 }); // b25 toast
+morph(13.0,  { w: 240, h: 64, r: 32, y: 0, z: 3.4, cy: 0 });         // b27 back to the button
+
+/* cursor, in world coordinates */
+const CUR = { x: new Track(36, SP.cursor), y: new Track(10, SP.cursor) };
+const MOVES = [
+  [0.75, 70, 56], [2.15, 72, 6], [2.65, 2, 70], [3.12, -44, 0], [3.8, 72, 2],
+  [4.62, -36, 4], [5.05, 290, 8], [5.88, 12, 6], [6.78, 0, 4], [7.62, 136, 4],
+  [8.3, 250, 112], [9.12, 18, 238], [9.85, 162, 176], [10.4, -40, 158],
+  [10.92, 252, 262], [12.55, 150, 196], [13.45, 36, 10],
+];
+for (const [t, x, y] of MOVES) { CUR.x.to(t, x); CUR.y.to(t, y); }
+const PRESSES = [[0.5], [2.5], [3.0], [3.5, 4.5], [5.0, 5.75], [6.5], [7.5], [8.0], [10.75]]
+  .map(([a, b]) => [a, b ?? a + 0.1]);
+const pressed = t => PRESSES.reduce((s, [a, b]) => s + held(t, a, b, SP.press), 0);
+
+/* scrub: direct manipulation while held, playback otherwise */
+const SCRUB = { play: 3.0, press: 3.5, rel: 4.5, p0: 0.36, dur: 198, W: 320 };
+function prog(t) {
+  const { play, press, rel, p0, dur, W } = SCRUB;
+  if (t < play) return p0;
+  const pP = p0 + (press - play) / dur;
+  if (t < press) return p0 + (t - play) / dur;
+  const drag = u => clamp(pP + (CUR.x.at(u) - CUR.x.at(press)) / W, 0, 1);
+  return t <= rel ? drag(t) : drag(rel) + (t - rel) / dur;
+}
+/* volume: direct while held; past max the slider rubber-bands, then springs back from wherever it was */
+const VOL = { press: 5.0, rel: 5.75, v0: 0.4, W: 360 };
+const volRaw = t => VOL.v0 + (CUR.x.at(t) - CUR.x.at(VOL.press)) / VOL.W;
+const vol = t => t < VOL.press ? VOL.v0 : clamp(volRaw(Math.min(t, VOL.rel)), 0, 1);
+const rubber = x => { const c = 110, k = 0.7; return c * (1 - 1 / (x * k / c + 1)); };
+const stretchHeld = t => rubber(Math.max(0, volRaw(t) - 1) * VOL.W);
+function stretch(t) {
+  if (t < VOL.press || t > VOL.rel + 2.5) return 0;
+  if (t <= VOL.rel) return stretchHeld(t);
+  const x0 = stretchHeld(VOL.rel), v0 = (x0 - stretchHeld(VOL.rel - 1e-3)) / 1e-3;
+  return free(x0, v0, t - VOL.rel, SP.snap);
+}
+/* time the slider hits 100 (for the sound) */
+function crossT(f, a, b) { for (let t = a; t < b; t += 1 / 960) if (f(t) >= 1) return t; return null; }
+
+/* pill: slider fill → toggle knob → liquid tab indicator.
+   Edges ride different springs so the leading edge runs ahead of the trailing one. */
+const HAND = 6.0;
+const sliderPill = (t, w, h) => ({ l: -w / 2, r: -w / 2 + vol(t) * w, top: 0, ph: h, ink: 0 });
+let PILL;
+function buildPill() {
+  const h0 = sliderPill(HAND, S.w.at(HAND) + stretch(HAND), S.h.at(HAND));
+  const T = v => new Track(v, SP.shape, false);
+  PILL = { l: T(h0.l), r: T(h0.r), top: T(h0.top), ph: T(h0.ph), ink: T(h0.ink, SP.ink) };
+  const tab = i => [-204 + 136 * i, -68 + 136 * i];
+  PILL.l.to(6.0, -50).to(6.5, -2, SP.trail).to(7.0, tab(0)[0], SP.lead).to(7.5, tab(1)[0], SP.trail).to(8.0, tab(2)[0], SP.trail);
+  PILL.r.to(6.0, 2).to(6.5, 50, SP.lead).to(7.0, tab(0)[1], SP.trail).to(7.5, tab(1)[1], SP.lead).to(8.0, tab(2)[1], SP.lead);
+  PILL.top.to(6.0, 6).to(8.5, 22);
+  PILL.ph.to(6.0, 52).to(7.0, 48);
+  PILL.ink.to(7.0, 1, SP.fast);                 // white fill → white knob → black indicator
+}
+const TABS_TOP = new Track(0).to(8.5, 16).to(11.5, 0);
+const ROW2_IDX = new Track(2).to(11.125, 1).to(12.5, 2);
+
+/* sounds, placed later by their measured peak */
+const SFX = [];
+for (const [a, b] of PRESSES) { SFX.push({ t: a, s: 'down' }); SFX.push({ t: b, s: 'up' }); }
+SFX.push({ t: 1.5, s: 'success' }, { t: 6.5, s: 'toggle' }, { t: 10.5, s: 'key' },
+  { t: 11.0, s: 'key' }, { t: 11.125, s: 'key' }, { t: 11.25, s: 'key' }, { t: 11.5, s: 'enter' }, { t: 12.5, s: 'success' });
+
+/* ───────────────────────── DOM ───────────────────────── */
+const $ = id => document.getElementById(id);
+const stage = $('stage'), world = $('world'), shape = $('shape'), cursor = $('cursor');
+const LAYERS = {};
+function layer(id, w, h, a, b, html, opt = {}) {
+  const el = document.createElement('div');
+  el.className = 'layer'; el.id = 'L_' + id;
+  el.style.width = w + 'px'; el.style.height = h + 'px';
+  el.innerHTML = html;
+  shape.appendChild(el);
+  LAYERS[id] = { el, w, h, a, b, anchor: opt.anchor || 'c' };
+}
+const W = '#fff', K = '#0B0B0B';
+function buildDom() {
+  layer('btn', 240, 64, 13.04, 0.52 + LOOP, `
+    <div class="row abs" style="inset:0;justify-content:center;gap:10px;color:${W};font-size:19px;font-weight:500">
+      <span>Continue</span><span id="arrow">${icon('arrow', 20, W)}</span></div>`);
+  layer('load', 72, 72, 0.62, 2.0, `
+    <svg width="72" height="72" viewBox="0 0 72 72" fill="none" stroke="${W}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <g id="ringG"><circle id="ring" cx="36" cy="36" r="17" pathLength="100"/></g>
+      <path id="chk" d="M28.6 36.4l5 5L43.6 31" pathLength="100"/></svg>`);
+  layer('island', 300, 52, 2.07, 2.5, `
+    <div class="row abs" style="inset:0;padding:0 11px;gap:11px;color:${W}">
+      <div style="width:30px;height:30px;border-radius:9px;background:${W};display:grid;place-items:center">
+        <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="none" stroke="${K}" stroke-width="2"/><circle cx="8" cy="8" r="2" fill="${K}"/></svg></div>
+      <div style="font-size:15px;font-weight:500;flex:1">Night Drive</div>
+      <svg width="26" height="18" viewBox="0 0 26 18">${[5, 11, 8, 3].map((h, i) => `<rect x="${1 + i * 7}" y="${9 - h / 2 - 2}" width="3" height="${h + 4}" rx="1.5" fill="${W}"/>`).join('')}</svg>
+    </div>`);
+  layer('player', 360, 224, 2.58, 4.5, `
+    <div class="abs" style="left:20px;top:20px;width:64px;height:64px;border-radius:14px;background:${K};display:grid;place-items:center">
+      <svg width="40" height="40" viewBox="0 0 40 40"><circle cx="20" cy="20" r="15" fill="none" stroke="${W}" stroke-width="2"/><circle cx="20" cy="20" r="8" fill="none" stroke="${W}" stroke-width="2"/><circle cx="20" cy="20" r="2.2" fill="${W}"/></svg></div>
+    <div class="abs" style="left:100px;top:25px;font-size:19px;font-weight:600;letter-spacing:-0.02em">Night Drive</div>
+    <div class="abs" style="left:100px;top:52px;font-size:15px;color:var(--mute)">Loop Theory</div>
+    <div id="trk" class="abs" style="left:20px;width:320px;background:var(--rule)"></div>
+    <div id="fil" class="abs" style="left:20px;background:${K}"></div>
+    <div id="knb" class="abs" style="background:${K};border-radius:50%"></div>
+    <div id="tEl" class="abs num" style="left:20px;top:128px;font-size:13px;color:var(--mute)"></div>
+    <div id="tRm" class="abs num" style="right:20px;top:128px;font-size:13px;color:var(--mute)"></div>
+    <div class="abs" style="left:100px;top:168px;color:${K}">${icon('prev', 24, K)}</div>
+    <div id="playB" class="abs" style="left:154px;top:154px;width:52px;height:52px;border-radius:50%;background:${K};display:grid;place-items:center">
+      <svg width="24" height="24" viewBox="0 0 24 24"><path id="pp" fill="${W}" stroke="${W}" stroke-width="1.6" stroke-linejoin="round"/></svg></div>
+    <div class="abs" style="left:236px;top:168px;color:${K}">${icon('next', 24, K)}</div>`);
+  layer('slider', 360, 64, 4.6, 6.0, `
+    <div class="abs" style="left:20px;top:20px;color:${K}">${icon('speaker', 24, K)}</div>`);
+  layer('tabs', 420, 60, 7.05, 10.5, `
+    <div id="tabsB" class="abs" style="inset:0">${tabLabels(K)}</div>
+    <div id="tabsW" class="abs" style="inset:0">${tabLabels(W)}</div>`, { anchor: 't' });
+  layer('chart', 452, 400, 8.62, 10.5, `
+    <div class="abs" style="left:28px;top:96px;font-size:14px;color:var(--mute)">Monthly active users</div>
+    <div class="abs num" style="left:26px;top:116px;font-size:40px;font-weight:600;letter-spacing:-0.035em">15.9k</div>
+    <div class="abs num" style="right:28px;top:132px;font-size:14px;font-weight:500">+24.8%<span style="color:var(--mute);font-weight:400"> vs 2025</span></div>
+    ${[0, 1, 2].map(i => `<div class="abs" style="left:28px;right:28px;top:${CH.yb - CH.yh + i * CH.yh / 2}px;height:1px;background:var(--rule)"></div>`).join('')}
+    ${MONTHS.map((m, i) => `<div class="abs" style="left:${CH.x0 + i * CH.dx - 15}px;width:30px;top:356px;text-align:center;font-size:11px;color:var(--mute)">${m[0]}</div>`).join('')}
+    <svg class="abs" style="left:0;top:0" width="452" height="400">
+      <line id="xh" y1="${CH.yb - CH.yh - 8}" y2="${CH.yb}" stroke="${K}" stroke-opacity=".18" stroke-width="1"/>
+      <path id="line" d="${linePath()}" fill="none" stroke="${K}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle id="dot" r="5" fill="${K}" stroke="${W}" stroke-width="2.5"/></svg>
+    <div id="tip" class="abs row num" style="height:30px;padding:0 11px;border-radius:15px;background:${K};color:${W};font-size:13px;font-weight:500;white-space:nowrap;gap:6px"></div>`, { anchor: 't' });
+  layer('pal', 420, palH(3), 10.58, 12.0, `
+    <div class="abs" style="left:20px;top:18px;color:${K}">${icon('search', 24, K)}</div>
+    <div class="abs row" style="left:54px;top:0;height:60px;font-size:17px">
+      <span id="q"></span><span id="caret" style="width:2px;height:22px;background:${K};margin-left:1px;border-radius:1px"></span>
+      <span id="ph" class="abs" style="left:3px;color:var(--mute);white-space:nowrap">Search commands</span></div>
+    <div id="kbd" class="abs" style="right:16px;top:17px;height:26px;padding:0 8px;line-height:26px;border-radius:7px;background:var(--well);font-size:13px;font-weight:500">⌘K</div>
+    <div id="div" class="abs" style="left:0;right:0;top:60px;height:1px;background:var(--rule)"></div>
+    <div id="hl" class="abs" style="left:8px;width:404px;height:44px;top:69px;border-radius:12px;background:${K}"></div>
+    ${[['speaker', 'Volume', '↵'], ['chart', 'View chart', '⌘G'], ['mic', 'Voice memo', '⌘M']].map(([ic, lab, hint], i) => `
+      <div id="r${i}" class="abs row" style="left:8px;width:404px;height:44px;padding:0 14px;gap:12px;font-size:15px;font-weight:500;color:${i ? K : W}">
+        ${icon(ic, 20, i ? K : W)}<span style="flex:1">${lab}</span><span style="font-size:13px;color:${i ? 'var(--mute)' : 'rgba(255,255,255,.6)'}">${hint}</span></div>`).join('')}`, { anchor: 't' });
+  layer('toast', 340, 60, 12.08, 13.0, `
+    <div class="row abs" style="inset:0;padding:0 20px;gap:12px;color:${W};font-size:16px;font-weight:500">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="${W}" stroke-width="2.18" stroke-linecap="round" stroke-linejoin="round">
+        <circle id="tc" cx="12" cy="12" r="9.5" pathLength="100" transform="rotate(-90 12 12)"/><path id="tk" d="M7.8 12.3l2.9 2.9 5.5-5.6" pathLength="100"/></svg>
+      <span>Volume set to 100%</span></div>`);
+  // #pill and #volN are the shape's first children, so every layer (icons, tab labels) sits above them
+  $('ring').setAttribute('stroke-dasharray', '25 100');
+}
+function tabLabels(c) {
+  return ['Overview', 'Revenue', 'Growth'].map((s, i) =>
+    `<div class="abs" style="left:${6 + 136 * i}px;width:136px;top:0;height:60px;line-height:60px;text-align:center;font-size:15px;font-weight:500;color:${c}">${s}</div>`).join('');
+}
+
+/* ───────────────────────── seek(t): every style is a function of t ───────────────────────── */
+const PLAY = [[[8, 5], [13.5, 8.5], [13.5, 15.5], [8, 19]], [[13.5, 8.5], [19, 12], [19, 12], [13.5, 15.5]]];
+const PAUSE = [[[7, 5], [10.5, 5], [10.5, 19], [7, 19]], [[13.5, 5], [17, 5], [17, 19], [13.5, 19]]];
+const mmss = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+function showLayer(L, t, w, h, z, offY = 0) {
+  const o = win(t, L.a, L.b), el = L.el;
+  if (o < 0.004) { el.style.display = 'none'; return 0; }
+  el.style.display = '';
+  el.style.left = px((w - L.w) / 2);
+  el.style.top = px(L.anchor === 't' ? offY : (h - L.h) / 2 + offY);
+  const done = o > 0.998;
+  el.style.opacity = done ? '' : o.toFixed(4);
+  const blur = (1 - o) * 14 / z;                     // constant on-screen blur
+  el.style.filter = done || blur < 0.05 ? '' : `blur(${blur.toFixed(2)}px)`;
+  el.style.transform = done ? '' : `scale(${(0.965 + 0.035 * o).toFixed(4)})`;
+  return o;
+}
+
+function seek(T) {
+  const t = ((T % LOOP) + LOOP) % LOOP;
+
+  /* camera */
+  const z = CAM.z.at(t), camX = CAM.x.at(t), camY = CAM.y.at(t);
+  world.style.transform = `translate(720px,720px) scale(${z.toFixed(5)}) translate(${px(-camX)},${px(-camY)})`;
+
+  /* the shape */
+  const st = stretch(t);
+  const dip = 0.035 * (tap(t, 0.5) + tap(t, 2.5) + tap(t, 6.5) + tap(t, 10.75));
+  let w = S.w.at(t) + st, h = S.h.at(t) - st * 0.12;
+  const sx = st / 2, sy = S.y.at(t);
+  w *= 1 - dip; h *= 1 - dip;
+  const r = Math.min(S.r.at(t), h / 2, w / 2), ink = S.ink.at(t);
+  Object.assign(shape.style, {
+    left: px(sx - w / 2), top: px(sy - h / 2), width: px(w), height: px(h), borderRadius: px(r),
+    background: gray(ink),
+    boxShadow: `0 1px 2px rgba(0,0,0,${(0.05 * (1 - ink)).toFixed(3)}), 0 14px 34px -10px rgba(0,0,0,${(0.10 + 0.06 * (1 - ink)).toFixed(3)})`,
+  });
+
+  /* layers */
+  showLayer(LAYERS.btn, t, w, h, z);
+  $('arrow').style.transform = `translateX(${px(3 * win(t, 13.9, 0.5 + LOOP, SP.cin, SP.fast))})`;
+
+  if (showLayer(LAYERS.load, t, w, h, z)) {
+    const lt = t - 0.56;
+    $('ringG').style.transform = `rotate(${(lt * 520 - 90 - 360 * H(lt - 0.75, SP.draw)).toFixed(2)}deg)`;
+    $('ringG').style.transformOrigin = '36px 36px';
+    const arc = 25 + 75 * H(t - 1.28, { f: 3, z: 1 });
+    $('ring').setAttribute('stroke-dasharray', `${arc.toFixed(2)} 100`);
+    const c = H(t - 1.5, { f: 3.2, z: 1 });
+    $('chk').setAttribute('stroke-dasharray', `${(c * 100).toFixed(2)} 100`);
+    $('chk').style.opacity = c > 0.002 ? 1 : 0;
+  }
+
+  showLayer(LAYERS.island, t, w, h, z);
+
+  if (showLayer(LAYERS.player, t, w, h, z)) {
+    const p = prog(t), hold = held(t, SCRUB.press, SCRUB.rel), th = 6 + 4 * hold;
+    Object.assign($('trk').style, { top: px(112 - th / 2), height: px(th), borderRadius: px(th / 2) });
+    Object.assign($('fil').style, { top: px(112 - th / 2), height: px(th), width: px(p * 320), borderRadius: px(th / 2) });
+    const kr = 7 * H(t - 3.3, SP.fast) + 2.5 * hold;
+    Object.assign($('knb').style, { left: px(20 + p * 320 - kr), top: px(112 - kr), width: px(2 * kr), height: px(2 * kr) });
+    $('tEl').textContent = mmss(p * SCRUB.dur);
+    $('tRm').textContent = '-' + mmss(SCRUB.dur - p * SCRUB.dur);
+    const m = H(t - 3.0, SP.icon), d = 1 - 0.07 * tap(t, 3.0);
+    $('playB').style.transform = `scale(${d.toFixed(4)})`;
+    $('pp').setAttribute('d', PLAY.map((q, i) => 'M' + q.map((pt, j) =>
+      `${lerp(pt[0], PAUSE[i][j][0], m).toFixed(3)} ${lerp(pt[1], PAUSE[i][j][1], m).toFixed(3)}`).join(' L') + 'Z').join(' '));
+  }
+
+  /* pill (slider fill → toggle knob → tab indicator) */
+  const po = win(t, 4.6, 10.5);
+  const pill = $('pill'), volN = $('volN');
+  if (po > 0.004) {
+    let P;
+    if (t < HAND) P = sliderPill(t, w, h);
+    else {
+      P = { l: PILL.l.at(t), r: PILL.r.at(t), top: PILL.top.at(t), ph: PILL.ph.at(t), ink: PILL.ink.at(t) };
+      const rest = t < 7 ? 52 : 136, over = clamp((P.r - P.l) / rest - 1, 0, 1);
+      const sq = P.ph * 0.16 * over; P.top += sq / 2; P.ph -= sq;   // a stretched drop gets thinner
+      P.l *= 1 - dip; P.r *= 1 - dip;
+    }
+    const pw = Math.max(0, P.r - P.l);
+    Object.assign(pill.style, {
+      display: '', opacity: po > 0.998 ? '' : po.toFixed(4),
+      left: px(w / 2 + P.l), top: px(P.top), width: px(pw), height: px(P.ph),
+      borderRadius: px(Math.min(P.ph, pw) / 2), background: gray(P.ink),
+      boxShadow: t >= HAND ? `0 1px 3px rgba(0,0,0,${(0.22 * (1 - P.ink)).toFixed(3)})` : '',
+    });
+    const vo = win(t, 4.6, 6.0);
+    if (vo > 0.004) {
+      Object.assign(volN.style, { display: '', opacity: vo.toFixed(4), left: px(w / 2 + P.r - 76), top: px((h - 64) / 2) });
+      volN.textContent = Math.round(vol(t) * 100);
+    } else volN.style.display = 'none';
+    /* tab labels: white copy clipped to the indicator */
+    if (t >= 6.9) {
+      const tt = TABS_TOP.at(t), lx = 210 + P.l, rx = 210 + P.r, pr = Math.min(P.ph, pw) / 2;
+      $('tabsW').style.clipPath = `inset(${px(P.top - tt)} ${px(420 - rx)} ${px(60 - (P.top - tt) - P.ph)} ${px(lx)} round ${px(pr)})`;
+    }
+  } else { pill.style.display = 'none'; volN.style.display = 'none'; }
+  showLayer(LAYERS.slider, t, w, h, z);
+
+  if (showLayer(LAYERS.tabs, t, w, h, z, TABS_TOP.at(t))) {
+  }
+  const so = H(t - 8.55, SP.cin) * win(t, 7.0, 10.5);
+  Object.assign($('seg').style, { display: so > 0.004 ? '' : 'none', opacity: so.toFixed(4), left: px((w - 420) / 2), top: px(TABS_TOP.at(t)) });
+
+  if (showLayer(LAYERS.chart, t, w, h, z)) {
+    const line = $('line'), len = line.__len || (line.__len = line.getTotalLength());
+    const d = H(t - 8.95, SP.draw);
+    line.setAttribute('stroke-dasharray', `${len} ${len}`);
+    line.setAttribute('stroke-dashoffset', ((1 - d) * len).toFixed(2));
+    const left = sx - w / 2, top = sy - h / 2;
+    const u = clamp((CUR.x.at(t) - left - CH.x0) / CH.dx, 0, 11);
+    const hx = CH.x0 + u * CH.dx, hy = crY(u);
+    const ho = win(t, 9.42, 10.5, SP.fast, SP.cout);
+    $('xh').setAttribute('x1', hx.toFixed(2)); $('xh').setAttribute('x2', hx.toFixed(2));
+    $('xh').style.opacity = ho.toFixed(3);
+    const dr = 5 * ho;
+    $('dot').setAttribute('cx', hx.toFixed(2)); $('dot').setAttribute('cy', hy.toFixed(2)); $('dot').setAttribute('r', dr.toFixed(2));
+    $('dot').style.opacity = ho > 0.01 ? 1 : 0;
+    const i0 = Math.floor(u), v = lerp(VALS[i0], VALS[Math.min(i0 + 1, 11)], u - i0);
+    const tip = $('tip');
+    tip.innerHTML = `<span style="opacity:.6">${MONTHS[Math.round(u)]}</span><span>${v.toFixed(1)}k</span>`;
+    const tw = tip.offsetWidth;
+    Object.assign(tip.style, { left: px(hx - tw / 2), top: px(hy - 46 + 6 * (1 - ho)), opacity: ho.toFixed(3) });
+    void top;
+  }
+
+  if (showLayer(LAYERS.pal, t, w, h, z)) {
+    const q = t < 11.0 ? '' : t < 11.125 ? 'v' : t < 11.25 ? 'vo' : 'vol';
+    $('q').textContent = q;
+    $('ph').style.opacity = q ? 0 : 1;
+    $('caret').style.opacity = H(t - 10.75, SP.fast).toFixed(3);
+    $('kbd').style.transform = `scale(${(1 - 0.12 * tap(t, 10.5)).toFixed(4)})`;
+    const ro = H(t - 11.0, SP.cin);
+    $('div').style.opacity = ro.toFixed(3);
+    const e = tap(t, 11.5);
+    Object.assign($('hl').style, { opacity: ro.toFixed(3), left: px(8 + 4 * e), width: px(404 - 8 * e), top: px(69 + 2 * e), height: px(44 - 4 * e) });
+    const rows = [[11.0, 99], [11.0, 11.125], [11.03, 11.25]];
+    rows.forEach(([a, b], i) => {
+      const el = $('r' + i), o = H(t - a, SP.cin) * (1 - H(t - b, SP.cout));
+      const idx = i === 2 ? ROW2_IDX.at(t) : i;
+      el.style.display = o < 0.004 ? 'none' : '';
+      el.style.opacity = o.toFixed(4);
+      el.style.top = px(69 + 44 * idx + 6 * (1 - o));
+      el.style.filter = o > 0.998 ? '' : `blur(${((1 - o) * 10 / z).toFixed(2)}px)`;
+    });
+  }
+
+  if (showLayer(LAYERS.toast, t, w, h, z)) {
+    $('tc').setAttribute('stroke-dasharray', `${(100 * H(t - 12.1, SP.draw)).toFixed(2)} 100`);
+    const k = H(t - 12.5, { f: 3.2, z: 1 });
+    $('tk').setAttribute('stroke-dasharray', `${(100 * k).toFixed(2)} 100`);
+    $('tk').style.opacity = k > 0.002 ? 1 : 0;
+  }
+
+  /* cursor: world position through the camera, constant size on screen */
+  const cx = 720 + (CUR.x.at(t) - camX) * z, cyy = 720 + (CUR.y.at(t) - camY) * z;
+  cursor.style.transform = `translate(${px(cx - 7)},${px(cyy - 4)}) scale(${(1 - 0.13 * pressed(t)).toFixed(4)})`;
+}
+
+/* ───────────────────────── boot ───────────────────────── */
+buildDom(); buildPill();
+for (const [k, tr] of Object.entries({ ...S, camz: CAM.z, camy: CAM.y, curx: CUR.x, cury: CUR.y, tabsTop: TABS_TOP, row2: ROW2_IDX })) tr.check(k);
+const hit = crossT(volRaw, VOL.press, VOL.rel);
+if (hit) SFX.push({ t: hit, s: 'limit' });
+SFX.sort((a, b) => a.t - b.t);
+Object.assign(window, { seek, LOOP, BPM, SFX });
+window.READY = document.fonts.load('500 16px Geist').then(() => document.fonts.ready).then(() => { seek(0); return true; });
+
+if (!/[?&]render/.test(location.search)) {
+  document.body.classList.add('preview');
+  const fit = () => stage.style.transform = `scale(${Math.min(innerWidth, innerHeight) / 1440})`;
+  addEventListener('resize', fit); fit();
+  const audio = new Audio('loop.m4a'); audio.loop = true;
+  let t0 = performance.now();
+  addEventListener('click', () => { audio.currentTime = 0; t0 = performance.now(); audio.play().catch(() => {}); });
+  const m = location.search.match(/[?&]t=([\d.]+)/);
+  const tick = now => { seek(m ? +m[1] : (now - t0) / 1000); if (!m) requestAnimationFrame(tick); };
+  window.READY.then(() => requestAnimationFrame(tick));
+}
+</script>
+</body>
+</html>
